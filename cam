@@ -1,0 +1,1026 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useCamera } from "./hooks/useCamera";
+import {
+  ASPECTS,
+  MODES,
+  SCENES,
+  findLook,
+  type AspectId,
+  type LightingId,
+  type ModeId,
+  type SceneId,
+} from "./lib/presets";
+import { Renderer, type AiAdjust, type RenderParams } from "./lib/renderer";
+import { PersonSegmenter, loadSegmenter, segStatus } from "./lib/segmenter";
+import { NEUTRAL_ADJUST, analyzeFrame, deriveAdjust, detectScene, type Stats } from "./lib/ai";
+import { addMedia, deleteMedia, listMedia } from "./lib/db";
+import { LightingDial, ModeSelector, YELLOW, ZoomPills } from "./components/Controls";
+import { Panels, type AiSettings, type PanelId } from "./components/Panels";
+import { Viewer, download, type Item } from "./components/Viewer";
+import {
+  AspectIcon,
+  BoltAutoIcon,
+  BoltIcon,
+  BoltSlashIcon,
+  ChevronDown,
+  ChevronUp,
+  FiltersIcon,
+  FlipIcon,
+  MoonIcon,
+  QrIcon,
+  SparklesIcon,
+  StylesIcon,
+  TimerIcon,
+} from "./components/Icons";
+
+const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const isVideoMode = (m: ModeId) => m === "video" || m === "cinematic";
+const even = (n: number) => Math.round(n / 2) * 2;
+
+function buildParams(S: any, seg: PersonSegmenter, adj: AiAdjust, capture: boolean, perfLow: boolean): RenderParams {
+  const portrait = S.mode === "portrait" || S.mode === "cinematic";
+  const plain = S.filterId === "original" && S.styleId === "standard";
+  let grade = S.gradeId !== "none" ? findLook(S.gradeId) : null;
+  if (!grade && S.ai.autoGrade && S.ai.scene && plain) grade = findLook(SCENES[S.scene as SceneId].grade);
+  const maskOk = seg.active && seg.coverage > 0.02;
+  return {
+    zoom: S.swZoom,
+    mirror: !capture && S.facing === "user",
+    filter: S.filterId === "original" ? null : findLook(S.filterId),
+    style: S.styleId === "standard" ? null : findLook(S.styleId),
+    grade,
+    warmth: S.warmth,
+    tone: S.tone,
+    ev: S.ev,
+    ai: S.ai.enhance ? adj : NEUTRAL_ADJUST,
+    hdr: S.ai.hdr && !(perfLow && !capture),
+    night: S.night && !(perfLow && !capture),
+    skin: S.ai.skin,
+    portrait,
+    lighting: S.mode === "portrait" ? S.lighting : "natural",
+    fnum: S.fnum,
+    focus: S.focus,
+    mask: (portrait || S.ai.skin > 0) && maskOk ? seg.mask : null,
+  };
+}
+
+function pickMime() {
+  const c = [
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+    "video/mp4",
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+  ];
+  return c.find((m) => (window as any).MediaRecorder?.isTypeSupported?.(m)) || "";
+}
+
+export default function App() {
+  const [facing, setFacing] = useState<"user" | "environment">("environment");
+  const cam = useCamera(facing);
+  const camRef = useRef(cam);
+  camRef.current = cam;
+
+  const [mode, setMode] = useState<ModeId>("photo");
+  const [zoom, setZoomState] = useState(1);
+  const [flash, setFlash] = useState<"off" | "auto" | "on">("off");
+  const [timer, setTimer] = useState(0);
+  const [aspect, setAspect] = useState<AspectId>("3:4");
+  const [grid, setGrid] = useState(false);
+  const [autoSave, setAutoSave] = useState(false);
+  const [filterId, setFilterId] = useState("original");
+  const [gradeId, setGradeId] = useState("none");
+  const [styleId, setStyleId] = useState("standard");
+  const [warmth, setWarmth] = useState(0);
+  const [tone, setTone] = useState(0);
+  const [ev, setEv] = useState(0);
+  const [lighting, setLighting] = useState<LightingId>("natural");
+  const [fnum, setFnum] = useState(2.8);
+  const [ai, setAi] = useState<AiSettings>({
+    enhance: true,
+    hdr: true,
+    scene: true,
+    autoGrade: true,
+    qr: true,
+    skin: 0,
+    night: "auto",
+  });
+  const [panel, setPanel] = useState<PanelId>(null);
+  const [tools, setTools] = useState(false);
+  const [scene, setScene] = useState<SceneId>("auto");
+  const [nightOn, setNightOn] = useState(false);
+  const [qr, setQr] = useState("");
+  const [recording, setRecording] = useState(false);
+  const [recSecs, setRecSecs] = useState(0);
+  const [countdown, setCountdown] = useState(0);
+  const [toast, setToast] = useState("");
+  const [items, setItems] = useState<Item[]>([]);
+  const [viewer, setViewer] = useState<number | null>(null);
+  const [snapshot, setSnapshot] = useState("");
+  const [focusUI, setFocusUI] = useState<{ x: number; y: number; k: number } | null>(null);
+  const [screenFlash, setScreenFlash] = useState(false);
+  const [shutterAnim, setShutterAnim] = useState(false);
+  const [busyMsg, setBusyMsg] = useState("");
+  const [flipRot, setFlipRot] = useState(0);
+  const [segState, setSegState] = useState(segStatus);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const vfRef = useRef<HTMLDivElement>(null);
+  const previewR = useRef<Renderer>(null as any);
+  const captureR = useRef<Renderer>(null as any);
+  const seg = useRef<PersonSegmenter>(null as any);
+  if (!previewR.current) {
+    previewR.current = new Renderer();
+    captureR.current = new Renderer();
+    seg.current = new PersonSegmenter();
+  }
+  const adj = useRef<AiAdjust>({ ...NEUTRAL_ADJUST });
+  const targetAdj = useRef<AiAdjust>({ ...NEUTRAL_ADJUST });
+  const statsRef = useRef<Stats | null>(null);
+  const focusRef = useRef({ x: 0.5, y: 0.45 });
+  const perfLow = useRef(false);
+  const perfEma = useRef(16);
+  const recRef = useRef<MediaRecorder | null>(null);
+  const recStarting = useRef(false);
+  const pendingStop = useRef(false);
+  const recTimerRef = useRef<number>(0);
+  const audioCtx = useRef<AudioContext | null>(null);
+  const toastTimer = useRef<number>(0);
+  const focusTimer = useRef<number>(0);
+  const holdTimer = useRef<number>(0);
+  const holdStarted = useRef(false);
+  const cdRef = useRef<number>(0);
+  const qrTimer = useRef<number>(0);
+  const sceneVote = useRef<{ s: SceneId; n: number }>({ s: "auto", n: 0 });
+  const torchWasOn = useRef(false);
+
+  const eff: AspectId = mode === "square" ? "1:1" : aspect;
+  const ratio = ASPECTS[eff];
+  const hwZoom = !!cam.caps.zoom;
+  // hardware zoom (incl. 0.5x where the browser exposes it) first, remaining zoom digitally
+  const swZoom = hwZoom ? Math.max(1, zoom / (cam.caps.zoom!.max || 1)) : Math.max(1, zoom);
+  const zoomRef = useRef(1);
+  zoomRef.current = zoom;
+  const needSeg = mode === "portrait" || mode === "cinematic" || ai.scene || ai.skin > 0;
+  const needMaskLive = mode === "portrait" || mode === "cinematic" || ai.skin > 0;
+  const nightActive = ai.night === "on" || (ai.night === "auto" && nightOn);
+
+  const S = {
+    mode, facing, filterId, gradeId, styleId, warmth, tone, ev, lighting, fnum, ai, scene,
+    swZoom, night: nightActive, focus: focusRef.current, ratio, needMaskLive, flash, timer, autoSave, recording,
+  };
+  const Sref = useRef<any>(S);
+  Sref.current = S;
+
+  /* ---------------- helpers ---------------- */
+  const showToast = useCallback((m: string) => {
+    setToast(m);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(""), 2600);
+  }, []);
+
+  const click = () => {
+    try {
+      const ac = (audioCtx.current ||= new AudioContext());
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = "square";
+      o.frequency.value = 1400;
+      g.gain.setValueAtTime(0.06, ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0005, ac.currentTime + 0.05);
+      o.connect(g).connect(ac.destination);
+      o.start();
+      o.stop(ac.currentTime + 0.06);
+    } catch {
+      /* ignore */
+    }
+    navigator.vibrate?.(12);
+  };
+
+  const saveItem = useCallback(async (blob: Blob, type: "photo" | "video", mime: string) => {
+    const id = Date.now();
+    await addMedia({ id, type, blob, mime, createdAt: id });
+    const it: Item = { id, type, blob, mime, url: URL.createObjectURL(blob) };
+    setItems((p) => [it, ...p]);
+    if (Sref.current.autoSave) download(it);
+  }, []);
+
+  /* ---------------- boot ---------------- */
+  useEffect(() => {
+    document.title = "HOP Camera";
+    listMedia().then((recs) =>
+      setItems(
+        recs.slice(0, 80).map((r) => ({
+          id: r.id,
+          type: r.type,
+          blob: r.blob,
+          mime: r.mime,
+          url: URL.createObjectURL(r.blob),
+        }))
+      )
+    );
+    // runtime PWA manifest (install to home screen)
+    try {
+      const icon =
+        "data:image/svg+xml;utf8," +
+        encodeURIComponent(
+          `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='112' fill='#111'/><circle cx='256' cy='270' r='120' fill='none' stroke='#fff' stroke-width='28'/><circle cx='256' cy='270' r='62' fill='#FFD60A'/><rect x='170' y='96' width='172' height='46' rx='23' fill='#fff'/></svg>`
+        );
+      const manifest = {
+        name: "HOP Camera",
+        short_name: "HOP Cam",
+        display: "fullscreen",
+        orientation: "portrait",
+        background_color: "#000000",
+        theme_color: "#000000",
+        start_url: location.href.split("#")[0],
+        icons: [{ src: icon, sizes: "any", type: "image/svg+xml", purpose: "any" }],
+      };
+      const link = document.createElement("link");
+      link.rel = "manifest";
+      link.href = URL.createObjectURL(new Blob([JSON.stringify(manifest)], { type: "application/manifest+json" }));
+      document.head.appendChild(link);
+    } catch {
+      /* ignore */
+    }
+    // keep screen awake
+    (navigator as any).wakeLock?.request?.("screen").catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!needSeg) return;
+    setSegState("loading");
+    loadSegmenter().then(() => setSegState(segStatus));
+  }, [needSeg]);
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      const st = camRef.current.videoRef.current?.srcObject as MediaStream | null;
+      const t = st?.getVideoTracks()[0];
+      if (!t || t.readyState !== "live") camRef.current.restart();
+      (navigator as any).wakeLock?.request?.("screen").catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  /* hardware zoom */
+  useEffect(() => {
+    const z = cam.caps.zoom;
+    if (!z || cam.state !== "ready") return;
+    cam.setHwZoom(clamp(zoom, z.min, z.max));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoom, cam.caps.zoom, cam.state]);
+
+  /* torch for video flash */
+  const setTorchSafe = async (on: boolean) => {
+    if (camRef.current.caps.torch) {
+      const ok = await camRef.current.setTorch(on);
+      torchWasOn.current = on && ok;
+      return ok;
+    }
+    return false;
+  };
+
+  /* ---------------- render loop ---------------- */
+  useEffect(() => {
+    let raf = 0;
+    let last = 0;
+    let lastAnalysis = 0;
+    const loop = (t: number) => {
+      raf = requestAnimationFrame(loop);
+      if (t - last < 28) return;
+      const v = camRef.current.videoRef.current;
+      const c = canvasRef.current;
+      if (!v || !c || v.readyState < 2 || !v.videoWidth) return;
+      last = t;
+      const s = Sref.current;
+      const baseW = isVideoMode(s.mode) ? 810 : 720;
+      previewR.current.resize(even(baseW), even(baseW / s.ratio));
+      if (s.needMaskLive) seg.current.update(v);
+      if (t - lastAnalysis > 500) {
+        lastAnalysis = t;
+        const st = analyzeFrame(v);
+        if (st) {
+          statsRef.current = st;
+          targetAdj.current = s.ai.enhance ? deriveAdjust(st) : { ...NEUTRAL_ADJUST };
+          if (s.ai.scene) {
+            if (!s.needMaskLive) seg.current.update(v, true);
+            const cand = detectScene(st, seg.current.active ? seg.current.coverage : 0);
+            const vote = sceneVote.current;
+            if (vote.s === cand) vote.n++;
+            else sceneVote.current = { s: cand, n: 1 };
+            if (sceneVote.current.n >= 3) setScene((p) => (p === cand ? p : cand));
+          } else setScene("auto");
+          setNightOn((p) => {
+            const n = st.luma < 0.17;
+            return p === n ? p : n;
+          });
+        }
+        if (s.ai.qr && !s.recording && "BarcodeDetector" in window) {
+          try {
+            const det = ((window as any).__qr ||= new (window as any).BarcodeDetector({ formats: ["qr_code"] }));
+            det
+              .detect(c)
+              .then((r: any[]) => {
+                if (r[0]?.rawValue) {
+                  setQr(r[0].rawValue);
+                  clearTimeout(qrTimer.current);
+                  qrTimer.current = window.setTimeout(() => setQr(""), 5000);
+                }
+              })
+              .catch(() => {});
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      // smooth AI adjustment
+      const a = adj.current;
+      const tg = targetAdj.current;
+      const k = 0.07;
+      a.brightness += (tg.brightness - a.brightness) * k;
+      a.contrast += (tg.contrast - a.contrast) * k;
+      a.saturation += (tg.saturation - a.saturation) * k;
+      if (tg.wb) {
+        const w = a.wb || [255, 255, 255];
+        a.wb = [w[0] + (tg.wb[0] - w[0]) * k, w[1] + (tg.wb[1] - w[1]) * k, w[2] + (tg.wb[2] - w[2]) * k];
+      } else a.wb = null;
+      const t0 = performance.now();
+      previewR.current.render(c, v, buildParams(s, seg.current, a, false, perfLow.current));
+      const dt = performance.now() - t0;
+      perfEma.current = perfEma.current * 0.92 + dt * 0.08;
+      if (perfEma.current > 30) perfLow.current = true;
+      else if (perfEma.current < 18) perfLow.current = false;
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  /* ---------------- capture ---------------- */
+  const capturePhoto = useCallback(async () => {
+    const C = camRef.current;
+    const v = C.videoRef.current;
+    if (!v || !v.videoWidth) return;
+    const s = Sref.current;
+    const luma = statsRef.current?.luma ?? 1;
+    const useFlash = s.flash === "on" || (s.flash === "auto" && luma < 0.16);
+    let torch = false;
+    if (useFlash) {
+      if (s.facing === "environment" && C.caps.torch) {
+        torch = await setTorchSafe(true);
+        await sleep(420);
+      } else {
+        setScreenFlash(true);
+        await sleep(380);
+      }
+    }
+    click();
+    setShutterAnim(true);
+    setTimeout(() => setShutterAnim(false), 120);
+    const a = s.ratio as number;
+    const vw = v.videoWidth,
+      vh = v.videoHeight;
+    let W: number, H: number;
+    if (vw / vh > a) {
+      H = vh;
+      W = Math.round(H * a);
+    } else {
+      W = vw;
+      H = Math.round(W / a);
+    }
+    const sc = Math.min(1, 2800 / Math.max(W, H));
+    W = even(W * sc);
+    H = even(H * sc);
+    const R = captureR.current;
+    R.resize(W, H);
+    const out = document.createElement("canvas");
+    const portrait = s.mode === "portrait" || s.mode === "cinematic";
+    try {
+      if (s.night && !useFlash) {
+        // multi-frame night capture: average frames to reduce noise
+        const acc = document.createElement("canvas");
+        acc.width = W;
+        acc.height = H;
+        const actx = acc.getContext("2d")!;
+        const N = 8;
+        for (let i = 0; i < N; i++) {
+          setBusyMsg(`Night · hold still ${N - i}`);
+          await sleep(140);
+          if (portrait || s.ai.skin > 0) seg.current.update(v, true);
+          R.render(out, v, buildParams(Sref.current, seg.current, adj.current, true, false));
+          actx.globalAlpha = 1 / (i + 1);
+          actx.drawImage(out, 0, 0);
+        }
+        out.width = W;
+        out.height = H;
+        out.getContext("2d")!.drawImage(acc, 0, 0);
+      } else {
+        if (portrait || s.ai.skin > 0) seg.current.update(v, true);
+        R.render(out, v, buildParams(s, seg.current, adj.current, true, false));
+      }
+      const blob: Blob | null = await new Promise((res) => out.toBlob(res, "image/jpeg", 0.95));
+      if (blob) await saveItem(blob, "photo", "image/jpeg");
+    } catch (e) {
+      console.warn(e);
+      showToast("ছবি তুলতে সমস্যা হয়েছে");
+    } finally {
+      setBusyMsg("");
+      if (torch) setTorchSafe(false);
+      setScreenFlash(false);
+    }
+  }, [saveItem, showToast]);
+
+  const snapDuringVideo = () => {
+    const c = canvasRef.current;
+    if (!c) return;
+    click();
+    setShutterAnim(true);
+    setTimeout(() => setShutterAnim(false), 120);
+    c.toBlob((b) => b && saveItem(b, "photo", "image/jpeg"), "image/jpeg", 0.93);
+  };
+
+  /* ---------------- video ---------------- */
+  const stopRec = useCallback(() => {
+    if (recStarting.current) {
+      pendingStop.current = true;
+      return;
+    }
+    const r = recRef.current;
+    if (r && r.state !== "inactive") r.stop();
+  }, []);
+
+  const startRec = useCallback(async () => {
+    if (recRef.current || recStarting.current) return;
+    const c = canvasRef.current;
+    if (!c || !(window as any).MediaRecorder) {
+      showToast("এই ব্রাউজারে ভিডিও রেকর্ডিং সাপোর্ট নেই");
+      return;
+    }
+    recStarting.current = true;
+    pendingStop.current = false;
+    const stream = c.captureStream(30);
+    let audio: MediaStream | null = null;
+    try {
+      audio = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      audio.getAudioTracks().forEach((t) => stream.addTrack(t));
+    } catch {
+      showToast("মাইক্রোফোন পারমিশন নেই — শব্দ ছাড়া রেকর্ড হচ্ছে");
+    }
+    const mime = pickMime();
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 9_000_000 } : { videoBitsPerSecond: 9_000_000 });
+    } catch {
+      rec = new MediaRecorder(stream);
+    }
+    const chunks: Blob[] = [];
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    rec.onstop = async () => {
+      clearInterval(recTimerRef.current);
+      audio?.getTracks().forEach((t) => t.stop());
+      recRef.current = null;
+      setRecording(false);
+      if (torchWasOn.current) setTorchSafe(false);
+      const type = rec.mimeType || mime || "video/webm";
+      const blob = new Blob(chunks, { type });
+      if (blob.size > 0) await saveItem(blob, "video", type);
+    };
+    if (Sref.current.flash === "on") await setTorchSafe(true);
+    rec.start(1000);
+    recRef.current = rec;
+    setRecording(true);
+    setRecSecs(0);
+    const t0 = Date.now();
+    recTimerRef.current = window.setInterval(() => setRecSecs(Math.floor((Date.now() - t0) / 1000)), 250);
+    navigator.vibrate?.(20);
+    recStarting.current = false;
+    if (pendingStop.current) {
+      pendingStop.current = false;
+      setTimeout(() => rec.state !== "inactive" && rec.stop(), 300);
+    }
+  }, [saveItem, showToast]);
+
+  /* ---------------- shutter ---------------- */
+  const cancelCountdown = () => {
+    clearInterval(cdRef.current);
+    setCountdown(0);
+  };
+
+  const triggerPhoto = () => {
+    const tm = Sref.current.timer as number;
+    if (tm > 0) {
+      let c = tm;
+      setCountdown(c);
+      cdRef.current = window.setInterval(() => {
+        c--;
+        if (c <= 0) {
+          clearInterval(cdRef.current);
+          setCountdown(0);
+          capturePhoto();
+        } else setCountdown(c);
+      }, 1000);
+    } else capturePhoto();
+  };
+
+  const onShutterDown = (e: React.PointerEvent) => {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    if (countdown > 0) {
+      cancelCountdown();
+      holdStarted.current = false;
+      return;
+    }
+    if (isVideoMode(mode)) return;
+    holdStarted.current = false;
+    holdTimer.current = window.setTimeout(() => {
+      holdStarted.current = true;
+      setPanel(null);
+      startRec();
+    }, 450);
+  };
+
+  const onShutterUp = () => {
+    if (countdown > 0) return;
+    if (isVideoMode(mode)) {
+      if (recording || recRef.current || recStarting.current) stopRec();
+      else {
+        setPanel(null);
+        startRec();
+      }
+      return;
+    }
+    clearTimeout(holdTimer.current);
+    if (holdStarted.current) {
+      holdStarted.current = false;
+      stopRec();
+      return;
+    }
+    triggerPhoto();
+  };
+
+  const onShutterCancel = () => {
+    clearTimeout(holdTimer.current);
+    if (holdStarted.current) {
+      holdStarted.current = false;
+      stopRec();
+    }
+  };
+
+  /* ---------------- zoom / lens (0.5x ultra-wide) ---------------- */
+  const zoomBusy = useRef(false);
+  const onZoomTo = useCallback(
+    async (zIn: number) => {
+      const C = camRef.current;
+      const s = Sref.current;
+      const hwMin = C.caps.zoom?.min ?? 1;
+      const hwMax = C.caps.zoom?.max ?? 5;
+      let z = clamp(zIn, Math.min(0.5, hwMin), Math.min(10, Math.max(hwMax, 5)));
+      if (s.facing === "user") z = clamp(z, 1, 2);
+      // below 1x: browser has no hardware zoom-out -> switch to the real ultra-wide lens
+      if (z < 1 && hwMin >= 1) {
+        if (zoomBusy.current) return;
+        if (C.lens !== "ultra") {
+          zoomBusy.current = true;
+          const ok = await C.selectLens("ultra");
+          zoomBusy.current = false;
+          if (!ok) {
+            showToast("এই ডিভাইস/ব্রাউজারে 0.5× (Ultra-wide) লেন্স পাওয়া যায়নি");
+            setZoomState(1);
+            return;
+          }
+        }
+        setZoomState(0.5);
+        return;
+      }
+      if (z >= 1 && C.lens === "ultra") {
+        if (zoomBusy.current) return;
+        zoomBusy.current = true;
+        await C.selectLens("main");
+        zoomBusy.current = false;
+      }
+      setZoomState(z);
+    },
+    [showToast]
+  );
+
+  /* ---------------- gestures ---------------- */
+  const ptrs = useRef(new Map<number, { x: number; y: number }>());
+  const g = useRef<any>({});
+  const dist = () => {
+    const p = [...ptrs.current.values()];
+    return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+  };
+
+  const changeMode = (m: ModeId) => {
+    if (recording) return;
+    setMode(m);
+    setPanel(null);
+  };
+
+  const makeSnapshot = () => {
+    const v = cam.videoRef.current;
+    if (!v || !v.videoWidth) return;
+    const c = document.createElement("canvas");
+    c.width = 132;
+    c.height = 168;
+    const x = c.getContext("2d")!;
+    const sc = Math.max(132 / v.videoWidth, 168 / v.videoHeight);
+    x.drawImage(v, (132 - v.videoWidth * sc) / 2, (168 - v.videoHeight * sc) / 2, v.videoWidth * sc, v.videoHeight * sc);
+    setSnapshot(c.toDataURL("image/jpeg", 0.7));
+  };
+
+  const openPanel = (p: PanelId) => {
+    if (panel === p) return setPanel(null);
+    if (p === "styles" || p === "filters") makeSnapshot();
+    setPanel(p);
+  };
+
+  const onPD = (e: React.PointerEvent) => {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    ptrs.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (ptrs.current.size === 1) {
+      g.current = { sx: e.clientX, sy: e.clientY, t: Date.now(), moved: false, vert: false, pinch: null, ev0: ev, hadPinch: false };
+    } else if (ptrs.current.size === 2) {
+      g.current.pinch = { d: dist(), z: zoomRef.current };
+      g.current.hadPinch = true;
+    }
+  };
+
+  const onPM = (e: React.PointerEvent) => {
+    if (!ptrs.current.has(e.pointerId)) return;
+    ptrs.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const gs = g.current;
+    if (ptrs.current.size >= 2 && gs.pinch) {
+      gs.moved = true;
+      onZoomTo(gs.pinch.z * (dist() / gs.pinch.d));
+      return;
+    }
+    if (ptrs.current.size === 1) {
+      const dx = e.clientX - gs.sx;
+      const dy = e.clientY - gs.sy;
+      if (Math.abs(dx) > 9 || Math.abs(dy) > 9) gs.moved = true;
+      if (focusUI && Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 9) {
+        gs.vert = true;
+        setEv(clamp(gs.ev0 - dy / 70, -2, 2));
+        clearTimeout(focusTimer.current);
+        focusTimer.current = window.setTimeout(() => setFocusUI(null), 2800);
+      }
+    }
+  };
+
+  const onPU = (e: React.PointerEvent) => {
+    const gs = g.current;
+    ptrs.current.delete(e.pointerId);
+    if (ptrs.current.size > 0) return;
+    if (gs.hadPinch || gs.vert) return;
+    const dx = e.clientX - gs.sx;
+    const dy = e.clientY - gs.sy;
+    if (!gs.moved && Date.now() - gs.t < 500) {
+      if (panel) return setPanel(null);
+      const r = vfRef.current!.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width;
+      const y = (e.clientY - r.top) / r.height;
+      focusRef.current = { x, y };
+      cam.focusAt(x, y);
+      setFocusUI({ x: e.clientX - r.left, y: e.clientY - r.top, k: Date.now() });
+      clearTimeout(focusTimer.current);
+      focusTimer.current = window.setTimeout(() => setFocusUI(null), 2800);
+      return;
+    }
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 2 && !recording) {
+      const i = MODES.findIndex((m) => m.id === mode);
+      const n = clamp(i + (dx < 0 ? 1 : -1), 0, MODES.length - 1);
+      changeMode(MODES[n].id);
+    }
+  };
+
+  /* ---------------- misc actions ---------------- */
+  const cycleFlash = () => {
+    const n = flash === "off" ? "auto" : flash === "auto" ? "on" : "off";
+    setFlash(n);
+    showToast(`Flash ${n.toUpperCase()}${facing === "user" || !cam.caps.torch ? " (screen flash)" : ""}`);
+  };
+
+  const flip = () => {
+    if (recording) return;
+    setFlipRot((r) => r + 180);
+    setZoomState(1);
+    setPanel(null);
+    setFacing((f) => (f === "user" ? "environment" : "user"));
+  };
+
+  const cycleNight = () => {
+    const n = ai.night === "auto" ? "on" : ai.night === "on" ? "off" : "auto";
+    setAi({ ...ai, night: n });
+    showToast(`Night mode: ${n.toUpperCase()}`);
+  };
+
+  const onSceneChip = () => {
+    const sg = SCENES[scene].suggest;
+    if (sg && sg !== mode) {
+      changeMode(sg);
+      showToast(`${SCENES[scene].label} mode চালু হয়েছে`);
+    }
+  };
+
+  const onDelete = (it: Item) => {
+    deleteMedia(it.id);
+    setItems((p) => p.filter((x) => x.id !== it.id));
+  };
+
+  const fmtTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  const portraitLike = mode === "portrait" || mode === "cinematic";
+  const videoLike = isVideoMode(mode);
+  const last = items[0];
+  const chipCls =
+    "pointer-events-auto flex items-center gap-1 rounded-full bg-black/45 px-3 py-[5px] text-[12px] font-bold backdrop-blur-md";
+
+  const tool = (key: string, active: boolean, icon: React.ReactNode, onClick: () => void) => (
+    <button
+      key={key}
+      onClick={onClick}
+      className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-full transition-colors"
+      style={{
+        background: active ? "rgba(255,214,10,0.2)" : "rgba(120,120,128,0.36)",
+        color: active ? YELLOW : "#fff",
+      }}
+    >
+      {icon}
+    </button>
+  );
+
+  return (
+    <div
+      className="fixed inset-0 mx-auto flex max-w-[520px] select-none flex-col overflow-hidden bg-black text-white"
+      style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display",Roboto,"Helvetica Neue",Arial,sans-serif' }}
+    >
+      <video ref={cam.videoRef} playsInline muted autoPlay className="pointer-events-none absolute h-px w-px opacity-0" />
+
+      {/* ---------- top bar ---------- */}
+      <div className="relative z-20 box-content flex h-[56px] shrink-0 items-center justify-between px-5 pt-[max(0px,env(safe-area-inset-top))]">
+        <button onClick={cycleFlash} className="flex h-10 w-10 items-center justify-center" style={{ color: flash === "on" ? YELLOW : "#fff" }}>
+          {flash === "off" ? <BoltSlashIcon size={22} /> : flash === "auto" ? <BoltAutoIcon size={22} /> : <BoltIcon size={22} filled />}
+        </button>
+        {recording ? (
+          <div className="flex items-center gap-2 rounded-[8px] bg-[#FF3B30] px-[10px] py-[3px] text-[15px] font-bold tabular-nums">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
+            {fmtTime(recSecs)}
+          </div>
+        ) : (
+          <button onClick={() => { setTools((t) => !t); setPanel(null); }} className="flex h-10 w-16 items-center justify-center">
+            {tools ? <ChevronDown size={22} /> : <ChevronUp size={22} />}
+          </button>
+        )}
+        <button
+          onClick={() => openPanel("ai")}
+          className="flex h-10 w-10 items-center justify-center"
+          style={{ color: panel === "ai" || ai.enhance ? YELLOW : "#fff" }}
+        >
+          <SparklesIcon size={23} />
+        </button>
+      </div>
+
+      {/* ---------- viewfinder ---------- */}
+      <div className="relative min-h-0 flex-1" style={{ containerType: "size" }}>
+        <div
+          ref={vfRef}
+          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 touch-none overflow-hidden rounded-[24px] bg-neutral-900 transition-[width] duration-300"
+          style={{ width: `min(100cqw, calc(100cqh * ${ratio}))`, aspectRatio: String(ratio) }}
+          onPointerDown={onPD}
+          onPointerMove={onPM}
+          onPointerUp={onPU}
+          onPointerCancel={onPU}
+        >
+          <canvas ref={canvasRef} className="h-full w-full" />
+          {grid && (
+            <div className="pointer-events-none absolute inset-0">
+              {[33.33, 66.66].map((p) => (
+                <div key={"v" + p} className="absolute inset-y-0 w-px bg-white/35" style={{ left: `${p}%` }} />
+              ))}
+              {[33.33, 66.66].map((p) => (
+                <div key={"h" + p} className="absolute inset-x-0 h-px bg-white/35" style={{ top: `${p}%` }} />
+              ))}
+            </div>
+          )}
+
+          {/* chips */}
+          <div
+            className="pointer-events-none absolute inset-x-0 top-3 flex flex-wrap items-start justify-between gap-2 px-3"
+            onPointerDown={(e) => e.stopPropagation()}
+            onPointerUp={(e) => e.stopPropagation()}
+          >
+            <div className="flex flex-col items-start gap-2">
+              {!recording && ai.scene && scene !== "auto" && scene !== "night" && (
+                <button onClick={onSceneChip} className={chipCls} style={{ color: YELLOW }}>
+                  <SparklesIcon size={14} /> {SCENES[scene].label}
+                  {SCENES[scene].suggest && SCENES[scene].suggest !== mode ? " ›" : ""}
+                </button>
+              )}
+              {nightActive && (
+                <div className={chipCls} style={{ color: YELLOW }}>
+                  <MoonIcon size={14} filled /> Night
+                </div>
+              )}
+              {portraitLike && segState === "loading" && <div className={chipCls + " text-white/80"}>AI মডেল লোড হচ্ছে…</div>}
+              {portraitLike && segState === "failed" && <div className={chipCls + " text-white/80"}>Offline: focus-blur মোড</div>}
+            </div>
+            {portraitLike && (
+              <button onClick={() => openPanel("depth")} className={chipCls + " pointer-events-auto"} style={{ color: panel === "depth" ? YELLOW : "#fff" }}>
+                <span className="italic">ƒ</span> {fnum.toFixed(1)}
+              </button>
+            )}
+          </div>
+
+          {qr && (
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onPointerUp={(e) => e.stopPropagation()}
+              onClick={() => (/^https?:\/\//i.test(qr) ? window.open(qr, "_blank") : navigator.clipboard?.writeText(qr).then(() => showToast("কপি হয়েছে")))}
+              className="absolute left-1/2 top-[70px] flex max-w-[85%] -translate-x-1/2 items-center gap-2 rounded-full bg-[#FFD60A] px-4 py-2 text-[13px] font-bold text-black shadow-lg"
+            >
+              <QrIcon size={16} />
+              <span className="truncate">{qr}</span>
+            </button>
+          )}
+
+          {/* focus square */}
+          {focusUI && (
+            <div className="pointer-events-none absolute" style={{ left: focusUI.x, top: focusUI.y }} key={focusUI.k}>
+              <div
+                className="absolute -translate-x-1/2 -translate-y-1/2 animate-[focus_.3s_ease-out]"
+                style={{ width: 76, height: 76, border: `1.5px solid ${YELLOW}`, borderRadius: 4 }}
+              >
+                {[0, 1, 2, 3].map((i) => (
+                  <span
+                    key={i}
+                    className="absolute bg-[#FFD60A]"
+                    style={
+                      i === 0
+                        ? { left: "50%", top: 0, width: 1.5, height: 6 }
+                        : i === 1
+                        ? { left: "50%", bottom: 0, width: 1.5, height: 6 }
+                        : i === 2
+                        ? { top: "50%", left: 0, width: 6, height: 1.5 }
+                        : { top: "50%", right: 0, width: 6, height: 1.5 }
+                    }
+                  />
+                ))}
+              </div>
+              <div className="absolute w-px bg-[#FFD60A]/70" style={{ left: 52, top: -50, height: 100 }} />
+              <div className="absolute -translate-x-1/2 -translate-y-1/2 text-[#FFD60A]" style={{ left: 52, top: -ev * 25 }}>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="#000" fillOpacity="0.4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                  <circle cx="12" cy="12" r="4" />
+                  <path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8" />
+                </svg>
+              </div>
+            </div>
+          )}
+
+          {countdown > 0 && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[140px] font-extralight" style={{ color: YELLOW }}>
+              {countdown}
+            </div>
+          )}
+          {busyMsg && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-24 flex justify-center">
+              <div className={chipCls} style={{ color: YELLOW }}>
+                <MoonIcon size={14} filled /> {busyMsg}
+              </div>
+            </div>
+          )}
+          {toast && (
+            <div className="pointer-events-none absolute inset-x-0 top-[44%] z-40 flex justify-center px-6">
+              <div className="rounded-2xl bg-black/65 px-4 py-2 text-center text-[13px] font-semibold backdrop-blur-md">{toast}</div>
+            </div>
+          )}
+
+          <Panels
+            panel={panel}
+            snapshot={snapshot}
+            timer={timer}
+            setTimer={setTimer}
+            aspect={aspect}
+            setAspect={setAspect}
+            filterId={filterId}
+            setFilterId={setFilterId}
+            gradeId={gradeId}
+            setGradeId={setGradeId}
+            styleId={styleId}
+            setStyleId={setStyleId}
+            warmth={warmth}
+            setWarmth={setWarmth}
+            tone={tone}
+            setTone={setTone}
+            fnum={fnum}
+            setFnum={setFnum}
+            ai={ai}
+            setAi={setAi}
+            grid={grid}
+            setGrid={setGrid}
+            autoSave={autoSave}
+            setAutoSave={setAutoSave}
+            modeLocked={mode === "square"}
+          />
+
+          {/* zoom pills */}
+          <div className="absolute inset-x-0 bottom-3 z-20 flex justify-center" onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()}>
+            <ZoomPills zoom={zoom} onZoom={onZoomTo} front={facing === "user"} />
+          </div>
+
+          {(shutterAnim || screenFlash) && (
+            <div className="pointer-events-none absolute inset-0 z-50" style={{ background: screenFlash ? "#fff" : "rgba(0,0,0,0.85)" }} />
+          )}
+          {cam.state === "starting" && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/60 text-[13px] font-semibold text-white/70">Starting camera…</div>
+          )}
+          {cam.state === "error" && (
+            <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-black px-8 text-center">
+              <div className="text-[16px] font-bold">Camera unavailable</div>
+              <div className="text-[13px] leading-relaxed text-white/70">{cam.error}</div>
+              <button onClick={() => cam.restart()} className="rounded-full px-6 py-2 text-[14px] font-bold text-black" style={{ background: YELLOW }}>
+                Try again
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ---------- bottom controls ---------- */}
+      <div className="shrink-0 pb-[max(14px,env(safe-area-inset-bottom))] pt-3">
+        {mode === "portrait" && !tools && !recording && (
+          <div className="mb-3 flex justify-center">
+            <LightingDial value={lighting} onChange={setLighting} />
+          </div>
+        )}
+        <div className="h-[44px]">
+          {tools && !recording ? (
+            <div className="no-scrollbar flex items-center justify-center gap-[10px] overflow-x-auto px-3">
+              {tool("timer", timer > 0 || panel === "timer", <TimerIcon size={21} />, () => openPanel("timer"))}
+              {tool("aspect", panel === "aspect", <AspectIcon size={21} />, () => openPanel("aspect"))}
+              {tool("styles", panel === "styles" || styleId !== "standard", <StylesIcon size={21} />, () => openPanel("styles"))}
+              {tool("filters", panel === "filters" || filterId !== "original" || gradeId !== "none", <FiltersIcon size={21} />, () => openPanel("filters"))}
+              {portraitLike && tool("depth", panel === "depth", <span className="text-[18px] font-bold italic">ƒ</span>, () => openPanel("depth"))}
+              {tool("night", ai.night !== "off" && (ai.night === "on" || nightOn), <MoonIcon size={21} filled={ai.night === "on"} />, cycleNight)}
+              {tool("ai", panel === "ai", <SparklesIcon size={21} />, () => openPanel("ai"))}
+            </div>
+          ) : (
+            <ModeSelector mode={mode} onChange={changeMode} disabled={recording} />
+          )}
+        </div>
+        <div className="mt-3 flex items-center justify-between px-9">
+          <button
+            onClick={() => last && setViewer(0)}
+            className="h-[52px] w-[52px] overflow-hidden rounded-[12px] bg-neutral-800"
+            style={{ opacity: recording ? 0 : 1, boxShadow: "0 0 0 1.5px rgba(255,255,255,0.25)" }}
+            aria-label="Gallery"
+          >
+            {last &&
+              (last.type === "photo" ? (
+                <img src={last.url} className="h-full w-full object-cover" alt="" draggable={false} />
+              ) : (
+                <video src={last.url + "#t=0.1"} className="h-full w-full object-cover" muted playsInline preload="metadata" />
+              ))}
+          </button>
+          <button
+            onPointerDown={onShutterDown}
+            onPointerUp={onShutterUp}
+            onPointerCancel={onShutterCancel}
+            onContextMenu={(e) => e.preventDefault()}
+            className="relative h-[80px] w-[80px] touch-none rounded-full transition-transform active:scale-95"
+            aria-label="Shutter"
+          >
+            <span className="absolute inset-0 rounded-full border-[4px] border-white" />
+            <span
+              className="absolute transition-all duration-200"
+              style={{
+                inset: recording ? 24 : 6,
+                borderRadius: recording ? 8 : 999,
+                background: videoLike || recording ? "#FF3B30" : "#fff",
+              }}
+            />
+          </button>
+          {recording ? (
+            <button onClick={snapDuringVideo} className="flex h-[52px] w-[52px] items-center justify-center rounded-full bg-white/15" aria-label="Photo">
+              <span className="h-[34px] w-[34px] rounded-full bg-white" />
+            </button>
+          ) : (
+            <button
+              onClick={flip}
+              className="flex h-[52px] w-[52px] items-center justify-center rounded-full"
+              style={{ background: "rgba(120,120,128,0.36)" }}
+              aria-label="Flip camera"
+            >
+              <span className="transition-transform duration-500" style={{ transform: `rotate(${flipRot}deg)` }}>
+                <FlipIcon size={25} />
+              </span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {viewer !== null && <Viewer items={items} start={viewer} onClose={() => setViewer(null)} onDelete={onDelete} />}
+    </div>
+  );
+}
